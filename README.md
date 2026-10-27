@@ -171,3 +171,5 @@ Watkins & Dayan (1992) and Mnih et al. (2015).
 * Offline training on logged outcomes; the live demo only checks that the router transfers to
   real API calls and does not re-measure quality with a judge.
 * The decision is one-step; sequential effects (budgets, conversation context) are future work.
+#   L L M _ R o u t e r  
+ 
