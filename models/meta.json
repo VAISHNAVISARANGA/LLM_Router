@@ -1,0 +1,53 @@
+{
+  "models": [
+    "mistralai/mistral-7b-chat",
+    "mistralai/mixtral-8x7b-chat",
+    "gpt-4-1106-preview"
+  ],
+  "lambda": 1.0,
+  "lambda_selection": "Fixed deployment objective chosen from validation quality/cost trade-offs; lambda sweep is diagnostic.",
+  "cost_scale": 0.013150700000000015,
+  "source": "routerbench",
+  "best_config": [
+    "q",
+    "embedding"
+  ],
+  "gpt_penalty": 0.02,
+  "agent_calibrations": {
+    "q_handcrafted": {
+      "seed": 0,
+      "gpt_penalty": 0.0
+    },
+    "q_embedding": {
+      "seed": 0,
+      "gpt_penalty": 0.02
+    },
+    "q_hybrid": {
+      "seed": 0,
+      "gpt_penalty": 0.0
+    },
+    "dqn_handcrafted": {
+      "seed": 0,
+      "gpt_penalty": 0.005
+    },
+    "dqn_embedding": {
+      "seed": 0,
+      "gpt_penalty": 0.0
+    },
+    "dqn_hybrid": {
+      "seed": 0,
+      "gpt_penalty": 0.0
+    }
+  },
+  "gpt_penalty_candidates": [
+    0.0,
+    0.005,
+    0.01,
+    0.02,
+    0.05,
+    0.1
+  ],
+  "reward_objective": "quality * (1 + difficulty_strength * (structural_difficulty - 1)) - lambda * normalized_cost",
+  "difficulty_source": "prompt-only structural proxy in [1, 2]",
+  "difficulty_strength": 1.0
+}

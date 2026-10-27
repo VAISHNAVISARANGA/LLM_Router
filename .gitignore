@@ -1,0 +1,14 @@
+.states
+*.db
+assets/external/
+.web
+*.py[cod]
+__pycache__/
+*.pyc
+.env
+.venv/
+data/*.pkl
+data/*.joblib
+data/*.npy
+*.egg-info/
+.pytest_cache/
