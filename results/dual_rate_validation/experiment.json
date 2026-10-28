@@ -1,0 +1,18 @@
+{
+  "selection_budget_per_1k_usd": 0.5,
+  "selection_objective": "maximize validation quality subject to average validation cost budget",
+  "dual_learning_rate": 1.0,
+  "selected_configuration": [
+    "dqn",
+    "embedding"
+  ],
+  "selected_seed": 2,
+  "validation_quality": 0.5884910485933504,
+  "validation_cost_per_1k_usd": 0.49909177932042387,
+  "validation_final_dual_lambda": 0.012559658377292143,
+  "test_final_dual_lambda": 0.6584363964123775,
+  "selection_feasible": true,
+  "reward_objective": "quality / estimated_difficulty - dynamic_lambda * normalized_cost",
+  "difficulty_source": "DifficultyEstimator predictions in [1, 5]",
+  "oracle_note": "Upper bound using per-test-query outcomes; not attainable by a prompt-only router."
+}

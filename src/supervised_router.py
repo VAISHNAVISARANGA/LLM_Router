@@ -11,6 +11,41 @@ from sklearn.ensemble import ExtraTreesRegressor
 from .env import reward_matrix
 
 
+class ModelCostPredictor:
+    """Predict per-model costs using training prompts and their observed costs."""
+
+    def __init__(self, random_state=42):
+        self.model = ExtraTreesRegressor(
+            n_estimators=250,
+            min_samples_leaf=2,
+            random_state=random_state,
+            n_jobs=-1,
+        )
+
+    def fit(self, X, costs):
+        X = np.asarray(X, dtype=np.float32)
+        costs = np.asarray(costs, dtype=np.float32)
+        if (
+            X.ndim != 2
+            or costs.ndim != 2
+            or len(X) != len(costs)
+            or not len(X)
+        ):
+            raise ValueError("X and costs must be non-empty aligned 2D arrays.")
+        if not np.all(np.isfinite(X)) or not np.all(np.isfinite(costs)) or np.any(costs < 0):
+            raise ValueError("X and costs must be finite; costs must be non-negative.")
+        self.model.fit(X, costs)
+        return self
+
+    def predict(self, X):
+        if not hasattr(self.model, "estimators_"):
+            raise RuntimeError("Call fit before predicting costs.")
+        X = np.asarray(X, dtype=np.float32)
+        if X.ndim != 2 or not np.all(np.isfinite(X)):
+            raise ValueError("X must be a finite 2D array.")
+        return np.maximum(self.model.predict(X), 0.0)
+
+
 def quality_gain_targets(quality, cost, cost_scale):
     """Adjacent upgrade gains for each same prompt: quality and normalized cost."""
     quality, cost = np.asarray(quality, float), np.asarray(cost, float)
@@ -63,8 +98,7 @@ class SupervisedRewardRouter:
 
 def tune_lambda_and_router(X_train, quality_train, cost_train, X_val, quality_val, cost_val,
                            cost_scale, lambdas, estimator_configs=None,
-                           difficulty_train=None, difficulty_val=None,
-                           difficulty_strength=1.0):
+                           difficulty_train=None, difficulty_val=None):
     """Choose lambda and estimator settings using validation reward only."""
     estimator_configs = estimator_configs or [
         {"estimator": "extra_trees", "n_estimators": 150, "min_samples_leaf": 2},
@@ -79,7 +113,6 @@ def tune_lambda_and_router(X_train, quality_train, cost_train, X_val, quality_va
             lam,
             cost_scale,
             difficulty=difficulty_train,
-            difficulty_strength=difficulty_strength,
         )
         val_rewards = reward_matrix(
             quality_val,
@@ -87,7 +120,6 @@ def tune_lambda_and_router(X_train, quality_train, cost_train, X_val, quality_va
             lam,
             cost_scale,
             difficulty=difficulty_val,
-            difficulty_strength=difficulty_strength,
         )
         for cfg in estimator_configs:
             router = SupervisedRewardRouter(**cfg).fit(X_train, train_rewards)

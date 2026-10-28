@@ -15,18 +15,16 @@ from .features import (
     EmbeddingFeaturizer,
     HandcraftedFeaturizer,
     HybridFeaturizer,
-    calculate_difficulty_scores,
+    embed_texts,
 )
+from .difficulty import DifficultyEstimator
 from . import plots
-from .config import DEFAULT_LAMBDA, LAMBDA_SWEEP, SEED
+from .config import SEED
 from .data import load_data
 from .env import reward_matrix
-from .evaluate import baseline_actions, evaluate_actions
-from .train import (
-    calibrate_final_action_penalty,
-    policy_actions,
-    train_agent,
-)
+from .evaluate import baseline_actions, dual_budget_actions, evaluate_actions
+from .train import action_scores, train_agent
+from .supervised_router import ModelCostPredictor
 CONFIGS = [
     ("q", "handcrafted"),
     ("q", "embedding"),
@@ -35,6 +33,7 @@ CONFIGS = [
     ("dqn", "embedding"),
     ("dqn", "hybrid"),
 ]
+DEFAULT_DUAL_LEARNING_RATES = [0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0]
 
 def available_configs(has_embeddings=True):
     configs = CONFIGS if has_embeddings else [
@@ -80,40 +79,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", default="data/processed.joblib")
     ap.add_argument(
-        "--lam",
+        "--budget-per-1k",
         type=float,
-        default=DEFAULT_LAMBDA,
-        help=(
-            "Reward cost-penalty weight for the trained/deployed model "
-            f"(default: {DEFAULT_LAMBDA:g})."
-        ),
+        default=0.50,
+        help="Hard average cost ceiling in USD per 1,000 prompts (default: 0.50).",
     )
     ap.add_argument(
-        "--lams",
+        "--dual-learning-rates",
         type=float,
         nargs="+",
-        default=LAMBDA_SWEEP,
-        help=(
-            "Lambda values for the validation/test trade-off report. "
-            "Different lambda rewards are different objectives and are not "
-            "ranked against each other to choose the deployment lambda."
-        ),
-    )
-    ap.add_argument(
-        "--gpt-penalties",
-        type=float,
-        nargs="+",
-        default=[0.0, 0.005, 0.01, 0.02, 0.05, 0.1],
-        help="Candidate penalties for the final action, selected on validation reward.",
-    )
-    ap.add_argument(
-        "--difficulty-strength",
-        type=float,
-        default=1.0,
-        help=(
-            "Strength of prompt-structure difficulty weighting on quality "
-            "(0 disables it; default 1 scales quality by 1x to 2x)."
-        ),
+        default=DEFAULT_DUAL_LEARNING_RATES,
+        help="Step sizes evaluated on validation data for the dual-price update.",
     )
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--episodes", type=int, default=500)
@@ -122,29 +98,20 @@ def main():
     ap.add_argument("--n-clusters", type=int, default=32)
     ap.add_argument("--out", default="results")
     ap.add_argument("--models-dir", default="models")
-    ap.add_argument("--quick", action="store_true", help="1 seed, 100 episodes, 3 lambdas")
+    ap.add_argument("--quick", action="store_true", help="1 seed and 100 training episodes")
     args = ap.parse_args()
     if args.quick:
-        args.seeds, args.episodes, args.lams = 1, 100, [0.0, args.lam, 4.0]
-    if not args.gpt_penalties or any(
-        not np.isfinite(penalty) or penalty < 0
-        for penalty in args.gpt_penalties
+        args.seeds, args.episodes = 1, 100
+    if not np.isfinite(args.budget_per_1k) or args.budget_per_1k <= 0:
+        ap.error("--budget-per-1k must be finite and positive")
+    if not args.dual_learning_rates or any(
+        not np.isfinite(rate) or rate <= 0
+        for rate in args.dual_learning_rates
     ):
-        ap.error("--gpt-penalties must contain finite, non-negative values")
-    if not np.isfinite(args.lam) or args.lam < 0:
-        ap.error("--lam must be finite and non-negative")
-    if not args.lams or any(
-        not np.isfinite(lam) or lam < 0 for lam in args.lams
-    ):
-        ap.error("--lams must contain finite, non-negative values")
-    if not np.isfinite(args.difficulty_strength) or args.difficulty_strength < 0:
-        ap.error("--difficulty-strength must be finite and non-negative")
-
+        ap.error("--dual-learning-rates must contain finite, positive values")
     fig_dir = os.path.join(args.out, "figures")
     os.makedirs(fig_dir, exist_ok=True)
     os.makedirs(args.models_dir, exist_ok=True)
-
-    # ---------------- data + features (fit on TRAIN only) ----------------
     
 # ---------------- data + features ----------------
     try:
@@ -190,65 +157,220 @@ def main():
 
     print(f"Cost normalization scale: ${cost_scale:.6f}")
 
-    # This score uses prompt structure only; it does not inspect RouterBench outcomes.
-    difficulty = calculate_difficulty_scores(data.prompts)
+    difficulty_embedder = data.embedder or "hash"
+    difficulty_estimator = DifficultyEstimator(embedder=difficulty_embedder).fit(
+        [data.prompts[i] for i in tr],
+        data.quality[tr],
+        embeddings=data.embeddings[tr] if data.embeddings is not None else None,
+    )
+    difficulty = difficulty_estimator.predict(
+        data.prompts,
+        embeddings=(
+            data.embeddings
+            if data.embeddings is not None
+            else embed_texts(data.prompts, difficulty_embedder)
+        ),
+    )
     print(
-        f"Prompt-structure difficulty range: "
+        f"Estimated difficulty range: "
         f"{difficulty.min():.2f} to {difficulty.max():.2f}"
     )
-    R = reward_matrix(
-        data.quality,
-        data.cost,
-        args.lam,
-        cost_scale,
-        difficulty=difficulty,
-        difficulty_strength=args.difficulty_strength,
-    )
-
+    R = reward_matrix(data.quality, data.cost, 0.0, cost_scale, difficulty=difficulty)
+    cost_predictors = {}
+    for name, feature_data in feats.items():
+        cost_predictors[name] = ModelCostPredictor(random_state=SEED).fit(
+            feature_data["cont"][tr],
+            data.cost[tr],
+        )
     histories = {k: [] for k in CONFIGS}
     results = {k: [] for k in CONFIGS}
-    best = {}   # best calibrated seed by validation reward, per config
-    calibration_rows = []
-
+    best = {}
+    candidates = []
     for key in CONFIGS:
         kind, fname = key
         for seed in range(args.seeds):
-            print(f"[main] {cfg_name(key)} seed {seed} ...", flush=True)
-            agent, hist = train_agent(kind, feats[fname], R, tr, seed, args.episodes,
-                                      args.episode_len, args.gamma)
-            histories[key].append(hist)
-            penalty, validation_reward = calibrate_final_action_penalty(
-                agent, feats[fname], va, R[va], args.gpt_penalties
+            print(f"[training] {cfg_name(key)} seed={seed} ...", flush=True)
+            agent, hist = train_agent(
+                kind,
+                feats[fname],
+                R,
+                tr,
+                seed,
+                args.episodes,
+                args.episode_len,
+                args.gamma,
             )
-            validation_actions = policy_actions(
-                agent, feats[fname], va, final_action_penalty=penalty
+            validation_scores = action_scores(agent, feats[fname], va)
+            validation_predicted_costs = cost_predictors[fname].predict(
+                feats[fname]["cont"][va]
             )
-            test_actions = policy_actions(
-                agent, feats[fname], te, final_action_penalty=penalty
-            )
-            va_res = evaluate_actions(
-                validation_actions, data, va, args.lam, cost_scale, rewards=R
-            )
-            te_res = evaluate_actions(
-                test_actions, data, te, args.lam, cost_scale, rewards=R
-            )
-            te_res["gpt_penalty"] = penalty
-            te_res["validation_reward"] = validation_reward
-            results[key].append(te_res)
-            calibration_rows.append({
-                "lambda": args.lam,
-                "configuration": cfg_name(key),
-                "seed": seed,
-                "validation_selected_penalty": penalty,
-                "validation_reward": va_res["reward"],
-                "test_reward": te_res["reward"],
-            })
-            if key not in best or validation_reward > best[key][0]:
-                best[key] = (validation_reward, agent, seed, penalty)
+            for dual_learning_rate in args.dual_learning_rates:
+                (
+                    validation_actions,
+                    validation_lambdas,
+                    validation_final_lambda,
+                ) = dual_budget_actions(
+                    validation_scores,
+                    validation_predicted_costs,
+                    data.cost[va],
+                    cost_scale,
+                    args.budget_per_1k,
+                    dual_learning_rate,
+                )
+                validation_metrics = evaluate_actions(
+                    validation_actions,
+                    data,
+                    va,
+                    0.0,
+                    cost_scale,
+                    rewards=R,
+                )
+                validation_cost = validation_metrics["cost_per_1k_usd"]
+                candidates.append({
+                    "config": key,
+                    "agent": agent,
+                    "seed": seed,
+                    "history": hist,
+                    "dual_learning_rate": dual_learning_rate,
+                    "validation_reward": validation_metrics["reward"],
+                    "validation_quality": validation_metrics["quality"],
+                    "validation_cost_per_1k": validation_cost,
+                    "validation_final_lambda": validation_final_lambda,
+                    "validation_mean_lambda": float(validation_lambdas.mean()),
+                    "feasible": validation_cost <= args.budget_per_1k,
+                })
 
-    base_acts = baseline_actions(data, te, tr, args.lam, cost_scale, SEED, rewards=R)
+    feasible_candidates = [candidate for candidate in candidates if candidate["feasible"]]
+    selection_pool = feasible_candidates if feasible_candidates else candidates
+    if feasible_candidates:
+        selected_candidate = max(
+            selection_pool,
+            key=lambda row: (
+                row["validation_quality"],
+                -row["validation_cost_per_1k"],
+            ),
+        )
+    else:
+        selected_candidate = min(
+            selection_pool,
+            key=lambda row: (
+                row["validation_cost_per_1k"],
+                -row["validation_quality"],
+            ),
+        )
+    best_key = selected_candidate["config"]
+    best = {}
+    sweep = {key: [] for key in CONFIGS}
+    sweep_rows = []
+    agent_calibrations = {}
+    for key in CONFIGS:
+        config_candidates = [row for row in candidates if row["config"] == key]
+        feasible_for_config = [row for row in config_candidates if row["feasible"]]
+        pool = feasible_for_config if feasible_for_config else config_candidates
+        chosen = (
+            max(pool, key=lambda row: (row["validation_quality"], -row["validation_cost_per_1k"]))
+            if feasible_for_config
+            else min(pool, key=lambda row: (row["validation_cost_per_1k"], -row["validation_quality"]))
+        )
+        best[key] = (
+            chosen["validation_quality"],
+            chosen["agent"],
+            chosen["seed"],
+            chosen["history"],
+            chosen["validation_reward"],
+            chosen["validation_final_lambda"],
+        )
+        agent_calibrations[f"{key[0]}_{key[1]}"] = {
+            "seed": chosen["seed"],
+            "validation_quality": chosen["validation_quality"],
+            "validation_final_dual_lambda": chosen["validation_final_lambda"],
+            "dual_learning_rate": chosen["dual_learning_rate"],
+        }
+        histories[key].append(chosen["history"])
+        test_scores = action_scores(chosen["agent"], feats[key[1]], te)
+        test_predicted_costs = cost_predictors[key[1]].predict(
+            feats[key[1]]["cont"][te]
+        )
+        test_actions, test_lambdas, test_final_lambda = dual_budget_actions(
+            test_scores,
+            test_predicted_costs,
+            data.cost[te],
+            cost_scale,
+            args.budget_per_1k,
+            chosen["dual_learning_rate"],
+        )
+        test_metrics = evaluate_actions(
+            test_actions,
+            data,
+            te,
+            0.0,
+            cost_scale,
+            rewards=R,
+        )
+        test_metrics.update({
+            "dual_final_lambda": test_final_lambda,
+            "dual_mean_lambda": float(test_lambdas.mean()),
+            "validation_reward": chosen["validation_reward"],
+            "validation_quality": chosen["validation_quality"],
+            "validation_cost_per_1k_usd": chosen["validation_cost_per_1k"],
+            "validation_final_lambda": chosen["validation_final_lambda"],
+            "dual_learning_rate": chosen["dual_learning_rate"],
+            "within_budget": chosen["feasible"],
+        })
+        results[key].append(test_metrics)
+        sweep[key].append((test_metrics["cost_per_1k_usd"], test_metrics["quality"]))
+        sweep_rows.append({
+            "method": cfg_name(key),
+            "seed": chosen["seed"],
+            "dual_learning_rate": chosen["dual_learning_rate"],
+            "selected_for_deployment": chosen is selected_candidate,
+            "within_budget": chosen["feasible"],
+            "validation_quality": chosen["validation_quality"],
+            "validation_cost_per_1k_usd": chosen["validation_cost_per_1k"],
+            "validation_final_dual_lambda": chosen["validation_final_lambda"],
+            "test_quality": test_metrics["quality"],
+            "test_cost_per_1k_usd": test_metrics["cost_per_1k_usd"],
+            "test_reward": test_metrics["reward"],
+            "test_final_dual_lambda": test_final_lambda,
+        })
+
+    pd.DataFrame([
+        {
+            "method": cfg_name(row["config"]),
+            "seed": row["seed"],
+            "validation_quality": row["validation_quality"],
+            "validation_cost_per_1k_usd": row["validation_cost_per_1k"],
+            "within_budget": row["feasible"],
+            "selected": row is selected_candidate,
+            "validation_mean_dual_lambda": row["validation_mean_lambda"],
+            "validation_final_dual_lambda": row["validation_final_lambda"],
+            "dual_learning_rate": row["dual_learning_rate"],
+        }
+        for row in candidates
+    ]).to_csv(os.path.join(args.out, "budget_selection_candidates.csv"), index=False)
+    if not feasible_candidates:
+        print(
+            f"WARNING: no validation candidate met the ${args.budget_per_1k:.4f}/1k "
+            "budget; selecting the lowest-cost candidate."
+        )
+    print(
+        f"Selected by validation constraint: {cfg_name(best_key)}, "
+        f"quality={selected_candidate['validation_quality']:.4f}, "
+        f"cost=${selected_candidate['validation_cost_per_1k']:.4f}/1k "
+        f"(budget=${args.budget_per_1k:.4f}/1k)"
+    )
+    base_acts = baseline_actions(
+        data,
+        te,
+        tr,
+        0.0,
+        cost_scale,
+        SEED,
+        rewards=R,
+    )
+
     base_res = {
-        name: evaluate_actions(actions, data, te, args.lam, cost_scale, rewards=R)
+        name: evaluate_actions(actions, data, te, 0.0, cost_scale, rewards=R)
         for name, actions in base_acts.items()
     }
 
@@ -263,15 +385,14 @@ def main():
         "cost_std": np.nan,
     })
     for key, rs in results.items():
-        metric_keys = [
-            key for key in rs[0]
-            if key not in ("validation_reward", "gpt_penalty")
-        ]
+        metric_keys = list(rs[0])
         m = {name: float(np.mean([r[name] for r in rs])) for name in metric_keys}
         rows.append({"method": cfg_name(key), **m,
                      "validation_reward_mean": float(np.mean([r["validation_reward"] for r in rs])),
-                     "gpt_penalty_mean": float(np.mean([r["gpt_penalty"] for r in rs])),
-                     "gpt_penalty_std": float(np.std([r["gpt_penalty"] for r in rs])),
+                     "validation_final_dual_lambda": float(rs[0]["validation_final_lambda"]),
+                     "validation_quality_mean": float(np.mean([r["validation_quality"] for r in rs])),
+                     "validation_cost_per_1k_usd_mean": float(np.mean([r["validation_cost_per_1k_usd"] for r in rs])),
+                     "within_budget": bool(rs[0]["within_budget"]),
                      "reward_std": float(np.std([r["reward"] for r in rs])),
                      "quality_std": float(np.std([r["quality"] for r in rs])),
                      "cost_std": float(np.std([r["cost_per_1k_usd"] for r in rs]))})
@@ -280,69 +401,13 @@ def main():
     table["quality_retained_%"] = 100 * table["quality"] / large["quality"]
     table.to_csv(os.path.join(args.out, "metrics_main.csv"), index=False)
     print(
-        f"\n=== Test-set results (deployment lambda={args.lam}, "
+        "\n=== Test-set results (dynamic dual-price controller, "
         f"{args.seeds} seeds) ==="
     )
     print(table.round(4).to_string(index=False))
 
-    # ---------------- lambda sweep (Pareto front) ----------------
-    sweep = {k: [] for k in CONFIGS}
-    sweep_rows = []
-    for lam in args.lams:
-        R_l = reward_matrix(
-            data.quality,
-            data.cost,
-            lam,
-            cost_scale,
-            difficulty=difficulty,
-            difficulty_strength=args.difficulty_strength,
-        )
-        for key in CONFIGS:
-            kind, fname = key
-            print(f"[sweep] lambda={lam} {cfg_name(key)} ...", flush=True)
-            agent, _ = train_agent(kind, feats[fname], R_l, tr, 0, args.episodes,
-                                   args.episode_len, args.gamma)
-            penalty, validation_reward = calibrate_final_action_penalty(
-                agent, feats[fname], va, R_l[va], args.gpt_penalties
-            )
-            validation_actions = policy_actions(
-                agent, feats[fname], va, final_action_penalty=penalty
-            )
-            test_actions = policy_actions(
-                agent, feats[fname], te, final_action_penalty=penalty
-            )
-            validation_metrics = evaluate_actions(
-                validation_actions, data, va, lam, cost_scale, rewards=R_l
-            )
-            test_metrics = evaluate_actions(
-                test_actions, data, te, lam, cost_scale, rewards=R_l
-            )
-            sweep[key].append(
-                (test_metrics["cost_per_1k_usd"], test_metrics["quality"])
-            )
-            sweep_rows.append({
-                "lambda": lam,
-                "method": cfg_name(key),
-                "validation_selected_penalty": penalty,
-                **{
-                    f"validation_{name}": value
-                    for name, value in validation_metrics.items()
-                },
-                **{f"test_{name}": value for name, value in test_metrics.items()},
-            })
-            calibration_rows.append({
-                "lambda": lam,
-                "configuration": cfg_name(key),
-                "seed": 0,
-                "validation_selected_penalty": penalty,
-                "validation_reward": validation_reward,
-                "test_reward": test_metrics["reward"],
-            })
+    # Report the selected checkpoint for each configuration.
     pd.DataFrame(sweep_rows).to_csv(os.path.join(args.out, "metrics_sweep.csv"), index=False)
-    pd.DataFrame(calibration_rows).to_csv(
-        os.path.join(args.out, "gpt_penalty_calibration.csv"),
-        index=False,
-    )
 
     # ---------------- figures ----------------
     plots.training_curves({k: np.stack(v) for k, v in histories.items()}, fig_dir)
@@ -353,35 +418,53 @@ def main():
     plots.reward_bars(bars, fig_dir)
 
     
-    # Select the configuration using validation reward only
-    # ---------------------------------------------------------
-# Select ONE configuration using validation reward.
-# Compare that selected agent with all baselines on test.
-# ---------------------------------------------------------
+    # Compare the validation-selected agent with baselines on the held-out test split.
 
-    best_key = max(best, key=lambda k: best[k][0])
-    best_val_reward, best_agent, best_seed, best_penalty = best[best_key]
+    (
+        best_val_quality,
+        best_agent,
+        best_seed,
+        _,
+        best_val_reward,
+        validation_final_lambda,
+    ) = best[best_key]
+    best_dual_learning_rate = agent_calibrations[
+        f"{best_key[0]}_{best_key[1]}"
+    ]["dual_learning_rate"]
 
     kind, feature_name = best_key
 
-    # Predictions from the single validation-selected checkpoint
-    agent_actions = policy_actions(
-        best_agent,
-        feats[feature_name],
-        te,
-        final_action_penalty=best_penalty,
+    agent_scores = action_scores(best_agent, feats[feature_name], te)
+    test_predicted_costs = cost_predictors[feature_name].predict(
+        feats[feature_name]["cont"][te]
+    )
+    agent_actions, test_lambdas, test_final_lambda = dual_budget_actions(
+        agent_scores,
+        test_predicted_costs,
+        data.cost[te],
+        cost_scale,
+        args.budget_per_1k,
+        best_dual_learning_rate,
     )
 
-    # Evaluate the selected agent on test
     agent_metrics = evaluate_actions(
-        agent_actions, data, te, args.lam, cost_scale, rewards=R
+        agent_actions, data, te, 0.0, cost_scale, rewards=R
+    )
+    agent_metrics["dual_final_lambda"] = test_final_lambda
+    agent_metrics["dual_mean_lambda"] = float(test_lambdas.mean())
+    agent_metrics["within_budget"] = (
+        agent_metrics["cost_per_1k_usd"] <= args.budget_per_1k
     )
 
     comparison_rows = [{
         "method": f"Selected agent: {cfg_name(best_key)}",
         "validation_reward": best_val_reward,
+        "validation_quality": best_val_quality,
+        "validation_cost_per_1k_usd": selected_candidate["validation_cost_per_1k"],
+        "validation_dual_final_lambda": validation_final_lambda,
+        "test_dual_final_lambda": test_final_lambda,
         "selected_seed": best_seed,
-        "validation_selected_gpt_penalty": best_penalty,
+        "validation_final_dual_lambda": validation_final_lambda,
         **agent_metrics,
     }]
 
@@ -392,7 +475,7 @@ def main():
     # Evaluate each baseline on the SAME test split
     for name, actions in base_acts.items():
         metrics = evaluate_actions(
-            actions, data, te, args.lam, cost_scale, rewards=R
+            actions, data, te, 0.0, cost_scale, rewards=R
         )
         display_name = "oracle_upper_bound" if name == "oracle" else name
 
@@ -400,7 +483,7 @@ def main():
             "method": display_name,
             "validation_reward": np.nan,
             "selected_seed": np.nan,
-            "validation_selected_gpt_penalty": np.nan,
+            "validation_final_dual_lambda": np.nan,
             "oracle_note": (
                 "Uses each test query's outcomes; upper bound, not attainable "
                 "by a prompt-only router."
@@ -414,7 +497,7 @@ def main():
             "mean_reward": metrics["reward"],
             "oracle_reward": oracle_reward,
             "regret_vs_oracle": oracle_reward - metrics["reward"],
-            "validation_selected_gpt_penalty": np.nan,
+            "validation_final_dual_lambda": np.nan,
             "oracle_note": (
                 "Per-test-query outcomes; upper bound, not attainable by a "
                 "prompt-only router."
@@ -439,7 +522,7 @@ def main():
         "mean_reward": agent_metrics["reward"],
         "oracle_reward": oracle_reward,
         "regret_vs_oracle": oracle_reward - agent_metrics["reward"],
-        "validation_selected_gpt_penalty": best_penalty,
+        "validation_final_dual_lambda": validation_final_lambda,
         "oracle_note": "",
     }
     for action, model in enumerate(data.models):
@@ -496,9 +579,16 @@ def main():
 
     print(f"\nSelected configuration: {cfg_name(best_key)}")
     print(f"Selected seed: {best_seed}")
-    print(f"Best validation reward: {best_val_reward:.4f}")
-    print(f"Validation-selected final-action penalty: {best_penalty:g}")
-
+    print(f"Validation quality: {best_val_quality:.4f}")
+    print(
+        f"Validation cost: ${selected_candidate['validation_cost_per_1k']:.4f}/1k "
+        f"(budget ${args.budget_per_1k:.4f}/1k)"
+    )
+    print(
+        f"Dual lambda: validation ended at {validation_final_lambda:.4f}; "
+        f"test ended at {test_final_lambda:.4f}"
+    )
+    print(f"Validation quality reward (diagnostic): {best_val_reward:.4f}")
     print("\n=== Selected agent vs baselines: TEST SET ===")
     print(comparison.round(4).to_string(index=False))
 
@@ -510,66 +600,63 @@ def main():
             values="selection_pct",
         ).round(2).to_string()
     )
-
     print("\nSaved:")
     print(f"  {args.out}/routing_diagnostics.csv")
     print(f"  {args.out}/reward_margin_diagnostics.csv")
-    print(f"  {args.out}/gpt_penalty_calibration.csv")
+    print(f"  {args.out}/budget_selection_candidates.csv")
     # ---------------- save trained agents + featurizers for the demo ----------------
-    agent_calibrations = {}
-    for key, (_, agent, seed, penalty) in best.items():
+    for key, (_, agent, seed, _, _, validation_dual_lambda) in best.items():
         ext = "npz" if key[0] == "q" else "pt"
         agent.save(os.path.join(args.models_dir, f"{key[0]}_{key[1]}.{ext}"))
-        agent_calibrations[f"{key[0]}_{key[1]}"] = {
-            "seed": seed,
-            "gpt_penalty": penalty,
-        }
     for name, f in featurizers.items():
         joblib.dump(f, os.path.join(args.models_dir, f"{name}_featurizer.joblib"))
+        joblib.dump(
+            cost_predictors[name],
+            os.path.join(args.models_dir, f"cost_predictor_{name}.joblib"),
+        )
     with open(os.path.join(args.models_dir, "meta.json"), "w") as fh:
         json.dump({
             "models": data.models,
-            "lambda": args.lam,
-            "lambda_selection": (
-                "Fixed deployment objective chosen from validation "
-                "quality/cost trade-offs; lambda sweep is diagnostic."
-            ),
+            "selection_budget_per_1k_usd": args.budget_per_1k,
+            "selection_objective": "maximize validation quality subject to average validation cost budget",
+            "dual_learning_rate": best_dual_learning_rate,
+            "dual_update": "lambda = max(0, lambda + eta * (observed_normalized_cost - budget_per_prompt_normalized))",
             "cost_scale": cost_scale,
             "source": data.source,
             "best_config": list(best_key),
-            "gpt_penalty": best_penalty,
             "agent_calibrations": agent_calibrations,
-            "gpt_penalty_candidates": args.gpt_penalties,
-            "reward_objective": (
-                "quality * (1 + difficulty_strength * (structural_difficulty - 1)) "
-                "- lambda * normalized_cost"
-            ),
-            "difficulty_source": "prompt-only structural proxy in [1, 2]",
-            "difficulty_strength": args.difficulty_strength,
+            "reward_objective": "quality / estimated_difficulty - dynamic_lambda * normalized_cost",
+            "difficulty_source": "DifficultyEstimator predictions in [1, 5]",
+            "selection_feasible": bool(selected_candidate["feasible"]),
+            "selected_agent": {
+                "config": list(best_key),
+                "seed": best_seed,
+                "validation_quality": best_val_quality,
+                "validation_cost_per_1k_usd": selected_candidate["validation_cost_per_1k"],
+                "dual_learning_rate": best_dual_learning_rate,
+            },
         }, fh, indent=2)
     with open(os.path.join(args.out, "experiment.json"), "w", encoding="utf-8") as fh:
         json.dump({
-            "lambda": args.lam,
-            "lambda_selection": (
-                "Fixed deployment objective chosen from validation "
-                "quality/cost trade-offs; lambda sweep is diagnostic."
-            ),
+            "selection_budget_per_1k_usd": args.budget_per_1k,
+            "selection_objective": "maximize validation quality subject to average validation cost budget",
+            "dual_learning_rate": best_dual_learning_rate,
             "selected_configuration": list(best_key),
             "selected_seed": best_seed,
-            "validation_selected_gpt_penalty": best_penalty,
-            "gpt_penalty_candidates": args.gpt_penalties,
-            "reward_objective": (
-                "quality * (1 + difficulty_strength * (structural_difficulty - 1)) "
-                "- lambda * normalized_cost"
-            ),
-            "difficulty_source": "prompt-only structural proxy in [1, 2]",
-            "difficulty_strength": args.difficulty_strength,
+            "validation_quality": best_val_quality,
+            "validation_cost_per_1k_usd": selected_candidate["validation_cost_per_1k"],
+            "dual_learning_rate": best_dual_learning_rate,
+            "validation_final_dual_lambda": validation_final_lambda,
+            "test_final_dual_lambda": test_final_lambda,
+            "selection_feasible": bool(selected_candidate["feasible"]),
+            "reward_objective": "quality / estimated_difficulty - dynamic_lambda * normalized_cost",
+            "difficulty_source": "DifficultyEstimator predictions in [1, 5]",
             "oracle_note": (
                 "Upper bound using per-test-query outcomes; not attainable by "
                 "a prompt-only router."
             ),
         }, fh, indent=2)
-    print(f"\nBest configuration on validation reward: {cfg_name(best_key)}")
+    print(f"\nBest configuration under validation budget: {cfg_name(best_key)}")
     print(f"Figures -> {fig_dir} | tables -> {args.out} | agents -> {args.models_dir}")
 if __name__ == "__main__":
     main()

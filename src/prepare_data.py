@@ -30,7 +30,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pkl", required=True, help="path to the real routerbench_0shot.pkl")
     ap.add_argument("--models", nargs="+", default=MODEL_POOL, help="cheap -> expensive")
-    ap.add_argument("--max-samples", type=int, default=12000)
+    ap.add_argument("--max-samples", type=int, default=40000)
     ap.add_argument("--embedder", choices=["minilm", "hash"], default="minilm")
     ap.add_argument(
         "--no-embeddings",

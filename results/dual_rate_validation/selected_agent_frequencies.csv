@@ -1,0 +1,22 @@
+method,model,selection_pct
+always_small,mistralai/mistral-7b-chat,100.0
+always_small,mistralai/mixtral-8x7b-chat,0.0
+always_small,gpt-4-1106-preview,0.0
+always_medium,mistralai/mistral-7b-chat,0.0
+always_medium,mistralai/mixtral-8x7b-chat,100.0
+always_medium,gpt-4-1106-preview,0.0
+always_large,mistralai/mistral-7b-chat,0.0
+always_large,mistralai/mixtral-8x7b-chat,0.0
+always_large,gpt-4-1106-preview,100.0
+random,mistralai/mistral-7b-chat,33.56464572680789
+random,mistralai/mixtral-8x7b-chat,33.21767713659606
+random,gpt-4-1106-preview,33.21767713659606
+length_based,mistralai/mistral-7b-chat,32.121986851716585
+length_based,mistralai/mixtral-8x7b-chat,34.00292184075968
+length_based,gpt-4-1106-preview,33.87509130752374
+oracle_upper_bound,mistralai/mistral-7b-chat,38.16654492330168
+oracle_upper_bound,mistralai/mixtral-8x7b-chat,33.5463842220599
+oracle_upper_bound,gpt-4-1106-preview,28.287070854638426
+Selected agent: DQN + embedding,mistralai/mistral-7b-chat,16.179693206720234
+Selected agent: DQN + embedding,mistralai/mixtral-8x7b-chat,56.848064280496715
+Selected agent: DQN + embedding,gpt-4-1106-preview,26.97224251278305

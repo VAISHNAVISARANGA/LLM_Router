@@ -4,7 +4,7 @@ One episode = a stream of `episode_len` user queries.
 At every step the agent
     sees   : the features of the current query               (state)
     picks  : which LLM answers it (0 = cheapest, last = most expensive) (action)
-    gets   : reward = quality - lambda * normalised_cost       (reward)
+    gets   : reward = quality / difficulty - lambda * normalised_cost (reward)
 
 Because every query was pre-answered by every model (RouterBench), the
 environment is a fast table lookup: R[query, model].
@@ -14,8 +14,6 @@ a contextual-bandit-style MDP (gamma = 0 by default).  We still use the full
 Q-learning / DQN update rules, with gamma exposed as a hyper-parameter.
 """
 import numpy as np
-
-
 def normalise_cost(cost, scale):
     """Map raw USD cost to ~[0, 1]; `scale` = 99th percentile of the large model's cost."""
     return np.clip(cost / scale, 0.0, 1.0)
@@ -28,13 +26,8 @@ def reward_matrix(
     lam,
     cost_scale,
     difficulty=None,
-    difficulty_strength=1.0,
 ):
-    """Return difficulty-weighted quality minus lambda-weighted normalized cost.
-
-    Difficulty is a prompt-only structural score in [1, 2]. The multiplier is
-    1 + difficulty_strength * (difficulty - 1); a strength of zero disables it.
-    """
+    """Return quality divided by difficulty, minus lambda-weighted normalized cost."""
     quality = np.asarray(quality, dtype=np.float64)
     cost = np.asarray(cost, dtype=np.float64)
 
@@ -44,9 +37,6 @@ def reward_matrix(
         raise ValueError("quality must be finite and in [0, 1].")
     if not np.isfinite(lam) or lam < 0:
         raise ValueError("lambda must be finite and non-negative.")
-    if not np.isfinite(difficulty_strength) or difficulty_strength < 0:
-        raise ValueError("difficulty strength must be finite and non-negative.")
-
     cost_norm = normalise_cost(cost, cost_scale)
 
     if difficulty is None:
@@ -59,11 +49,10 @@ def reward_matrix(
     if not np.all(np.isfinite(difficulty)):
         raise ValueError("Difficulty scores must be finite.")
 
-    if np.any((difficulty < 1.0) | (difficulty > 2.0)):
-        raise ValueError("Structural difficulty scores must be in [1, 2].")
-    quality_weight = 1.0 + difficulty_strength * (difficulty - 1.0)
+    if np.any((difficulty < 1.0) | (difficulty > 5.0)):
+        raise ValueError("Difficulty scores must be in [1, 5].")
 
-    return quality * quality_weight[:, None] - lam * cost_norm
+    return quality / difficulty[:, None] - lam * cost_norm
 
 class RoutingEnv:
     def __init__(self, R, disc, cont, pool_idx, episode_len=100, seed=0):

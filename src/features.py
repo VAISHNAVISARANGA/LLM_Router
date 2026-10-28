@@ -20,7 +20,6 @@ import numpy as np
 from sklearn.cluster import KMeans
 
 import re
-import numpy as np
 
 
 def extract_structural_features(prompt: str) -> np.ndarray:
@@ -81,10 +80,7 @@ def extract_structural_features(prompt: str) -> np.ndarray:
             has_math,
         ],
         dtype=np.float32,
-    )
-
-import numpy as np
-
+    )      
 
 class HybridFeaturizer:
     """Combine handcrafted features and MiniLM semantic embeddings."""
@@ -173,7 +169,7 @@ def calculate_difficulty_scores(prompts):
     )
 
     complexity = (
-        0.40 * length_score
+        0.30 * length_score
         + 0.25 * has_code
         + 0.25 * has_math
         + 0.05 * code_score

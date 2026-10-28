@@ -70,8 +70,8 @@ def ask(client, model, prompt, max_tokens):
 
 
 def show_scores(q_values, labels, selected):
-    """Display the actual values returned by the trained agent."""
-    print("\nLearned action scores after validation calibration (not quality or cost predictions):")
+    """Display the dual-adjusted action scores."""
+    print("\nDual-adjusted action scores (not quality predictions):")
     print(f"{'Model tier':<12} {'Action':>7} {'Score':>12}  Status")
     print("-" * 48)
 
@@ -80,8 +80,8 @@ def show_scores(q_values, labels, selected):
         print(f"{labels[i]:<12} {i:>7} {float(score):>12.5f}  {status}")
 
     print(
-        f"\nDecision: {labels[selected]} was selected because its learned "
-        f"score is the highest among the {len(q_values)} actions."
+        f"\nDecision: {labels[selected]} had the highest adjusted score among "
+        f"{len(q_values)} actions."
     )
 
 
@@ -104,9 +104,9 @@ def main():
         help="A single prompt. If omitted, read prompts from --file.",
     )
     parser.add_argument("--file", default="demo_queries.txt")
-    parser.add_argument("--agent", choices=["q", "dqn"], default="q")
+    parser.add_argument("--agent", choices=["q", "dqn"], default=None)
     parser.add_argument(
-        "--state", choices=["handcrafted", "embedding"], default="handcrafted"
+        "--state", choices=["handcrafted", "embedding", "hybrid"], default=None
     )
     parser.add_argument("--models-dir", default="models")
     parser.add_argument(
@@ -184,12 +184,16 @@ def main():
         print("\n" + "=" * 76)
         print(f"PROMPT: {prompt}")
         show_scores(scores, labels, action)
+        print(f"Current dual lambda: {router.dual_lambda:.5f}")
 
         if action == len(labels) - 1:
             large_count += 1
 
         if client is None:
-            print("\nDry run: no API calls made; no response quality or live cost measured.")
+            print(
+                "\nDry run: no API calls made; no response quality or live cost "
+                "measured, so the dual price is not updated."
+            )
             continue
 
         # Compare every model, or the selected model plus the large baseline.
@@ -220,7 +224,11 @@ def main():
             print_cost(label, model_name, cost)
 
         if selected_label in results:
-            routed_costs.append(results[selected_label]["cost"])
+            selected_cost = results[selected_label]["cost"]
+            routed_costs.append(selected_cost)
+            router.observe_cost(selected_cost)
+        else:
+            router.observe_cost(None)
 
         if large_label in results:
             large_costs.append(results[large_label]["cost"])
